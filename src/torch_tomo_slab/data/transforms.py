@@ -1,83 +1,84 @@
-from typing import Dict, Tuple, List
-import torch
-import torchvision.transforms as T
-import torchvision.transforms.functional as F
-from torchvision.transforms import InterpolationMode
+# src/torch_tomo_slab/data/transforms.py
 
-from torch_tomo_slab import config
+from typing import Dict
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from .weight_maps import generate_boundary_weight_map
 
-class JointTransform:
+FINAL_CROP_SIZE = 512
+
+class AddBoundaryWeightMap(A.core.transforms_interface.ImageOnlyTransform):
     """
-    Applies the same random geometric transform to an image and its label map.
-    Operates on a dictionary of tensors.
+    Albumentations transform to generate and add a boundary weight map.
+    This is designed to run on the mask.
     """
+    def __init__(self, high_weight: float = 10.0, base_weight: float = 1.0, always_apply=True, p=1.0):
+        super().__init__(always_apply, p)
+        self.high_weight = high_weight
+        self.base_weight = base_weight
 
-    def __init__(self):
-        # These are just for storing parameters, the logic is custom.
-        self.affine_params = T.RandomAffine.get_params(
-            degrees=(-10, 10),
-            translate=(0.1, 0.1),
-            scale_ranges=(0.9, 1.1),
-            shears=None,
-            img_size=[1, 1]  # Placeholder, will be replaced
-        )
+    def apply(self, img, **params) -> Dict[str, any]:
+        # 'img' here is actually the mask
+        return generate_boundary_weight_map(img, self.high_weight, self.base_weight)
 
-    def __call__(self, sample: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        image, label = sample['image'], sample['label']
-
-        # 1. Random Flips (50% chance for each)
-        if torch.rand(1) < 0.5:
-            image = F.hflip(image)
-            label = F.hflip(label)
-        if torch.rand(1) < 0.5:
-            image = F.vflip(image)
-            label = F.vflip(label)
-
-        # 2. Random Affine (applied together)
-        affine_params = T.RandomAffine.get_params(
-            degrees=(-15, 15),
-            translate=(0.1, 0.1),
-            scale_ranges=(0.9, 1.1),
-            shears=None,
-            img_size=list(image.shape[-2:])
-        )
-        image = F.affine(image, *affine_params, interpolation=InterpolationMode.BILINEAR)
-        # Use NEAREST for the label to preserve integer class values
-        label = F.affine(label, *affine_params, interpolation=InterpolationMode.NEAREST)
-
-        # 3. Intensity transforms (applied only to image)
-        # Using ColorJitter on a 2-channel scientific image is possible but can have
-        # unexpected effects. Let's use more direct methods.
-        # Add random noise
-        if torch.rand(1) < 0.3:
-            noise = torch.randn_like(image) * 0.05
-            image = image + noise
-
-        # Random blur
-        if torch.rand(1) < 0.3:
-            image = F.gaussian_blur(image, kernel_size=3, sigma=(0.1, 1.0))
-
-        sample['image'] = image
-        sample['label'] = label
-        return sample
-
-
-
-def get_transforms(is_training: bool = True) -> T.Compose:
-    """
-    Create a torchvision transform pipeline for 2D medical image segmentation.
-    With pre-normalization, this pipeline now only contains augmentations.
-    """
-    transform_list: List[callable] = []
-
+def get_transforms(is_training: bool = True) -> A.Compose:
     if is_training:
-        transform_list.append(JointTransform())
+        transform_list = [
+            A.PadIfNeeded(min_height=1024, min_width=1024, border_mode=0, value=0, mask_value=0, p=1.0),
+            A.Rotate(limit=90, p=0.7, border_mode=0, value=0, mask_value=0),
+            A.Transpose(p=0.5),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.4),
+            A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+            A.GaussianBlur(blur_limit=(3, 7), p=0.3),
+            A.RandomCrop(height=FINAL_CROP_SIZE, width=FINAL_CROP_SIZE, p=1.0),
+            # The ToTensorV2 call will be handled after adding the weight map
+        ]
+    else:
+        transform_list = [
+            A.CenterCrop(height=512, width=512, p=1.0),
+            A.Resize(height=FINAL_CROP_SIZE, width=FINAL_CROP_SIZE, p=1.0),
+        ]
 
-    # --- REMOVED: Normalization is no longer applied here. ---
-    # transform_list.append(NormalizeSample())
-
-    # If no transforms are needed (i.e., validation), return None or an empty Compose.
-    if not transform_list:
-        return None
+    # Use a wrapper function to handle weight map creation and tensor conversion
+    def processing_wrapper(image, mask):
+        # Create a separate pipeline for the mask to generate the weight map
+        mask_pipeline = A.Compose([AddBoundaryWeightMap(high_weight=10.0)])
+        weight_map = mask_pipeline(image=mask)['image'] # Pass mask as image
         
-    return T.Compose(transform_list)
+        # Apply the main transforms
+        base_transforms = A.Compose(transform_list)
+        transformed = base_transforms(image=image, mask=mask)
+        image_transformed, mask_transformed = transformed['image'], transformed['mask']
+
+        # Apply the same transforms to the weight map, except for pixel-level ones
+        # We just need to ensure it's cropped/rotated the same way as the image/mask
+        weight_map_transformed = base_transforms(image=weight_map, mask=mask_transformed)['image']
+
+        # Convert all to tensors
+        to_tensor = ToTensorV2()
+        image_tensor = to_tensor(image=image_transformed)['image']
+        mask_tensor = to_tensor(image=mask_transformed)['image']
+        weight_map_tensor = to_tensor(image=weight_map_transformed)['image']
+        
+        return {
+            'image': image_tensor,
+            'mask': mask_tensor,
+            'weight_map': weight_map_tensor
+        }
+
+    # Since the processing logic is now more complex, we return a lambda.
+    # The dataset will call this lambda.
+    # Note: This approach is a bit of a workaround for albumentations' design.
+    # A cleaner but more involved method would be to create a custom A.Compose.
+    # For now, let's modify how the dataset calls the transform.
+    
+    # We will adjust the dataset to handle this logic instead.
+    # Returning the simple list and handling it in the dataset is cleaner.
+    
+    # Add our custom transform to be applied ON THE MASK.
+    # Albumentations doesn't have a direct way to transform a mask and produce a new output key.
+    # The modification in the dataset __getitem__ is the cleanest approach.
+    
+    return A.Compose(transform_list)

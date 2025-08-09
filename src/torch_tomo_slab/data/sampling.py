@@ -1,129 +1,98 @@
-from typing import Tuple, List, Dict, Optional
-import numpy as np
-import torch
-from torch.utils.data import Dataset
-import torchio as tio
+# src/torch_tomo_slab/data/sampling.py
 
+import torch
+import torchio as tio
+from torch.utils.data import Dataset
+from typing import Dict, List, Iterator, Union
 
 class TorchioPatchSampler:
     """
-    A robust patch sampler that leverages torchio's sampling strategies.
-    This version returns a list of all patches from a given volume.
+    A wrapper to apply a TorchIO patch sampler to a dictionary of tensors.
+    This class is now designed to handle two modes:
+    1. Using a pre-instantiated sampler (like LabelSampler).
+    2. Using a string identifier ('grid') to instantiate GridSampler per-subject.
     """
-    def __init__(
-        self,
-        patch_size: Tuple[int, int],
-        samples_per_volume: int,
-        label_probabilities: Optional[Dict[int, float]] = None,
-    ):
-        self.patch_size = patch_size + (1,)  # Add dummy Z dimension
-        self.samples_per_volume = samples_per_volume
+    def __init__(self, sampler: Union[tio.data.sampler.PatchSampler, str], patch_size: int, overlap: int):
+        """
+        Initializes the patch sampler wrapper.
 
-        if label_probabilities:
-            self.sampler = tio.LabelSampler(
-                patch_size=self.patch_size,
-                label_name='label',
-                label_probabilities=label_probabilities,
-            )
-        else:
-            self.sampler = tio.UniformSampler(patch_size=self.patch_size)
-
-        self.padder = tio.CropOrPad(
-            target_shape=self.patch_size,
-            padding_mode='constant',
-        )
+        Args:
+            sampler: Either an instance of a TorchIO sampler (e.g., tio.LabelSampler)
+                     or the string 'grid' to indicate GridSampling.
+            patch_size: The size of the patches to extract.
+            overlap: The overlap between adjacent patches.
+        """
+        self.sampler = sampler
+        self.patch_size = patch_size
+        self.overlap = overlap
+        pad_amount = overlap // 2
+        self.padder = tio.Pad((pad_amount, pad_amount, pad_amount, pad_amount, 0, 0))
 
     def __call__(self, sample: Dict[str, torch.Tensor]) -> List[Dict[str, torch.Tensor]]:
         """
-        Generates a list of random patches from a single sample (image-label dict).
+        Takes a 2D sample, converts it to a 3D TorchIO subject, and extracts patches.
         """
-        image_3d = sample['image']
-        label_3d = sample['label']
-
-        if image_3d.ndim != 3:
-            raise ValueError(f"Sampler expected a 3D image tensor (C, H, W), but got {image_3d.ndim}D.")
-
-        image_4d = image_3d.unsqueeze(-1)
-        label_4d = label_3d.unsqueeze(-1)
+        image_2d, label_2d = sample['image'], sample['label']
+        image_3d, label_3d = image_2d.unsqueeze(1), label_2d.unsqueeze(1)
 
         subject = tio.Subject(
-            image=tio.ScalarImage(tensor=image_4d),
-            label=tio.LabelMap(tensor=label_4d),
+            image=tio.ScalarImage(tensor=image_3d),
+            label=tio.LabelMap(tensor=label_3d),
         )
-
         padded_subject = self.padder(subject)
-
+        
+        # --- LOGIC TO HANDLE DIFFERENT SAMPLER TYPES ---
+        if isinstance(self.sampler, str) and self.sampler == 'grid':
+            # Instantiate GridSampler here, where the subject is available
+            grid_sampler = tio.GridSampler(
+                subject=padded_subject,
+                patch_size=self.patch_size,
+                patch_overlap=self.overlap,
+            )
+            patch_generator = grid_sampler
+        else:
+            # For pre-instantiated samplers like LabelSampler
+            patch_generator = self.sampler(padded_subject)
+        
         patches = []
-        patch_generator = self.sampler(padded_subject)
-
-        for i, patch_subject in enumerate(patch_generator):
-            if i >= self.samples_per_volume:
-                break
-
-            patches.append({
-                'image': patch_subject.image.data.squeeze(-1),
-                'label': patch_subject.label.data.squeeze(-1)
-            })
+        for patch in patch_generator:
+            image_patch = patch['image'][tio.DATA].squeeze(1)
+            label_patch = patch['label'][tio.DATA].squeeze(1)
+            patches.append({'image': image_patch, 'label': label_patch})
+            
         return patches
 
 class IterablePatchDataset(torch.utils.data.IterableDataset):
     """
-    An iterable dataset that ensures each batch contains patches from different
-    source images, maximizing batch diversity. It achieves this by generating patches
-    in a round-robin fashion from all subjects.
+    An iterable dataset that yields patches from a subjects dataset.
+    Handles multi-worker data distribution.
     """
-    def __init__(
-            self,
-            subjects_dataset: Dataset,
-            patch_sampler: TorchioPatchSampler,
-            shuffle_subjects: bool = True,
-    ):
+    def __init__(self, subjects_dataset: Dataset, patch_sampler: TorchioPatchSampler):
         super().__init__()
         self.subjects_dataset = subjects_dataset
         self.patch_sampler = patch_sampler
-        self.num_patches_per_subject = self.patch_sampler.samples_per_volume
-        self.shuffle_subjects = shuffle_subjects
 
     def __len__(self) -> int:
-        """
-        Returns the total number of patches that will be generated across all subjects.
-        """
-        return len(self.subjects_dataset) * self.num_patches_per_subject
+        return len(self.subjects_dataset)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         worker_info = torch.utils.data.get_worker_info()
-        if worker_info is None:
-            worker_id = 0
-            num_workers = 1
-        else:
-            worker_id = worker_info.id
-            num_workers = worker_info.num_workers
-
-        # Each worker gets a unique slice of the subjects
+        worker_id = 0 if worker_info is None else worker_info.id
+        num_workers = 1 if worker_info is None else worker_info.num_workers
+        
         all_subject_indices = list(range(len(self.subjects_dataset)))
         subject_indices_for_this_worker = all_subject_indices[worker_id::num_workers]
 
-        # Pre-generate all patches for all subjects this worker is responsible for.
-        # This can be memory-intensive but ensures correct behavior.
         patches_from_all_subjects = []
         for subject_idx in subject_indices_for_this_worker:
             subject_sample = self.subjects_dataset[subject_idx]
-            patches_from_all_subjects.append(self.patch_sampler(subject_sample))
-
-        # This generator seeds itself based on the worker's seed provided by the DataLoader
+            subject_patches = self.patch_sampler(subject_sample)
+            patches_from_all_subjects.extend(subject_patches)
+        
         generator = torch.Generator()
-        generator.manual_seed(torch.initial_seed())
-
-        # Iterate in a "round-robin" or "pass-through" fashion
-        for i in range(self.num_patches_per_subject):
-            # Collect the i-th patch from every subject
-            pass_patches = [subject_patches[i] for subject_patches in patches_from_all_subjects]
-
-            # Shuffle the order of patches within this pass
-            if self.shuffle_subjects:
-                perm = torch.randperm(len(pass_patches), generator=generator)
-                for p_idx in perm:
-                    yield pass_patches[p_idx]
-            else:
-                for patch in pass_patches:
-                    yield patch
+        if worker_info:
+            generator.manual_seed(worker_info.seed)
+        
+        perm = torch.randperm(len(patches_from_all_subjects), generator=generator)
+        for idx in perm:
+            yield patches_from_all_subjects[idx]

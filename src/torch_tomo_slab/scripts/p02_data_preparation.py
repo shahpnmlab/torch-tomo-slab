@@ -1,237 +1,149 @@
+import argparse
+import logging
+import gc
 from pathlib import Path
 from typing import Dict, List, Tuple
+
 import mrcfile
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.model_selection import train_test_split
-import sys
-import argparse
+from tqdm import tqdm
 
-# Add parent src directory to path to allow importing from `torch_tomo_slab`
-sys.path.append(str(Path(__file__).resolve().parents[2]))
 from torch_tomo_slab import config
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def get_device() -> torch.device:
+    if torch.cuda.is_available(): logging.info("CUDA is available. Using GPU."); return torch.device("cuda")
+    logging.info("CUDA not available. Using CPU."); return torch.device("cpu")
+
+def resize_and_pad_3d(tensor: torch.Tensor, target_shape: Tuple[int, int, int], mode: str) -> torch.Tensor:
+    """Resizes and pads a 3D volume to a target shape."""
+    is_label = (mode == 'label')
+    input_dtype = tensor.dtype
+    tensor = tensor.float()
+
+    tensor_5d = tensor.unsqueeze(0).unsqueeze(0)
+    resized_5d = F.interpolate(
+        tensor_5d,
+        size=target_shape,
+        mode='trilinear' if not is_label else 'nearest',
+        align_corners=False if not is_label else None
+    )
+    resized_tensor = resized_5d.squeeze(0).squeeze(0)
+    
+    if is_label:
+        resized_tensor = resized_tensor.to(input_dtype)
+
+    shape = resized_tensor.shape
+    discrepancy = [max(0, ts - s) for ts, s in zip(target_shape, shape)]
+    if not any(d > 0 for d in discrepancy):
+        return resized_tensor
+
+    padding = []
+    for d in reversed(discrepancy):
+        pad_1, pad_2 = d // 2, d - (d // 2)
+        padding.extend([pad_1, pad_2])
+
+    padding_value = torch.median(tensor).item() if not is_label else 0
+    return F.pad(resized_tensor, tuple(padding), mode='constant', value=padding_value)
 
 def robust_normalization(data: torch.Tensor) -> torch.Tensor:
-    """
-    Normalizes a 2D torch.Tensor using 5th and 95th percentiles, clipping values.
-    This makes the normalization robust to extreme outliers.
-    """
-    # Move to float for calculations
     data = data.float()
-    
-    p5 = torch.quantile(data, 0.05)
-    p95 = torch.quantile(data, 0.95)
-    
-    # Check for a flat, zero-variance image
-    if p95 - p5 < 1e-6:
-        return data - data.mean()
+    p5, p95 = torch.quantile(data, 0.05), torch.quantile(data, 0.95)
+    if p95 - p5 < 1e-5: return data - torch.median(data)
+    return (data - torch.median(data)) / (p95 - p5)
 
-    # Normalize based on the 5-95 percentile range
-    data_normalized = (data - torch.median(data)) / (p95 - p5)
-    
-    # Clip to a fixed range to prevent extreme values from dominating
-    return torch.clamp(data_normalized, min=-5, max=5)
-
-
-def get_device():
-    """Dynamically select the best available device."""
-    if torch.cuda.is_available():
-        print("Using GPU: cuda")
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        print("Using Apple Silicon GPU: mps")
-        return torch.device("mps")
-    print("Using CPU")
-    return torch.device("cpu")
-
-
-def load_mrc_as_tensor(p: Path) -> Dict:
-    """
-    Loads an MRC file into a CPU tensor. Normalization is now done later.
-    """
-    with mrcfile.open(p, permissive=True) as mrc:
-        vol_numpy = mrc.data.astype(np.float32)
-        angpix = float(mrc.voxel_size.x) if hasattr(mrc.voxel_size, 'x') else 1.0
-        
-    return {"volume_tensor": torch.from_numpy(vol_numpy), "angpix": angpix}
-
-
-def local_variance_2d(image: torch.Tensor, kernel_size: int = 5) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute local mean and variance for a 2D image using torch's convolution.
-    Args:
-        image: 2D tensor of shape (H, W) that has already been normalized.
-        kernel_size: Size of the sliding window
-    Returns:
-        A tuple of (local_mean, local_variance) 2D tensors.
-    """
-    if image.dim() != 2:
-        raise ValueError("Input image must be a 2D tensor.")
-
-    image_float = image.unsqueeze(0).unsqueeze(0).float()  # (1, 1, H, W)
-
-    # Create a uniform kernel for averaging
+def local_variance_2d(image: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    image_float = image.unsqueeze(0).unsqueeze(0).float()
     kernel = torch.ones(1, 1, kernel_size, kernel_size, device=image.device) / (kernel_size ** 2)
     padding = kernel_size // 2
-
-    # Local mean of the already normalized image is just a blurred version of it
-    local_mean = F.conv2d(image_float, kernel, padding=padding).squeeze()
-
-    # Variance = E[X²] - (E[X])²
-    # We compute variance on the *normalized* image.
-    local_mean_sq = F.conv2d(image_float ** 2, kernel, padding=padding).squeeze()
-    local_variance = torch.clamp(local_mean_sq - local_mean ** 2, min=0)
-
-    # The first channel is now the normalized image itself, not its local mean.
-    return image, local_variance
-
+    local_mean = F.conv2d(image_float, kernel, padding=padding)
+    local_mean_sq = F.conv2d(image_float ** 2, kernel, padding=padding)
+    return torch.clamp(local_mean_sq - local_mean ** 2, min=0).squeeze(0).squeeze(0)
 
 def find_data_pairs(vol_dir: Path, label_dir: Path) -> List[Tuple[Path, Path]]:
-    """Finds matching volume and label files based on their base names."""
-    pairs = []
-    vol_files = sorted(list(vol_dir.glob("*.mrc")))
-    
-    label_files_map = {
-        p.stem: p for p in label_dir.glob("*.mrc")
-    }
-
-    for vol_path in vol_files:
-        base_name = vol_path.stem
-        if base_name in label_files_map:
-            pairs.append((vol_path, label_files_map[base_name]))
-        else:
-            print(f"Warning: No matching label found for volume '{vol_path.name}'. Skipping.")
-
+    pairs, label_files_map = [], {f.stem: f for f in label_dir.glob("*.mrc")}
+    for vol_path in sorted(list(vol_dir.glob("*.mrc"))):
+        if vol_path.stem in label_files_map: pairs.append((vol_path, label_files_map[vol_path.stem]))
+        else: logging.warning(f"No matching label for {vol_path.name}")
     return pairs
 
-def process_and_save_slices(
-    data_pairs: List[Tuple[Path, Path]],
-    output_dir: Path,
-    num_sections: int,
-    kernel_size: int,
-    device: torch.device,
-    set_name: str
-):
-    """Processes a list of volume pairs and saves their slices to a directory."""
-    print(f"\n--- Processing {len(data_pairs)} volumes for the {set_name} set ---")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    for vol_file, label_file in data_pairs:
-        print(f"  - Processing {vol_file.name}")
-
-        # --- Load raw data, normalization happens after projection ---
-        vol_data_dict = load_mrc_as_tensor(vol_file)
-        label_data_dict = load_mrc_as_tensor(label_file)
-
-        volume = vol_data_dict['volume_tensor'].to(device)
-        label = label_data_dict['volume_tensor'].to(device)
-
-        for i in range(num_sections):
-            axis_to_slice = torch.randint(1, 3, (1,)).item()
-            slice_dim_size = volume.shape[axis_to_slice]
-            if slice_dim_size < 3:
-                print(f"  Warning: Cannot extract 3-slice window from axis {axis_to_slice} with size {slice_dim_size}. Skipping.")
-                continue
-            slice_idx = torch.randint(1, slice_dim_size - 1, (1,)).item()
-
-            if axis_to_slice == 1:
-                view = "zx"
-                vol_slice = volume[:, slice_idx - 1:slice_idx + 2, :]
-                ortho_img_raw = torch.sum(vol_slice, dim=1)
-                ortho_label = label[:, slice_idx, :]
-            else: # axis_to_slice == 2
-                view = "zy"
-                vol_slice = volume[:, :, slice_idx - 1:slice_idx + 2]
-                ortho_img_raw = torch.sum(vol_slice, dim=2)
-                ortho_label = label[:, :, slice_idx]
-
-            # --- MODIFIED: Normalize the 2D projected image ---
-            ortho_img_normalized = robust_normalization(ortho_img_raw)
-
-            # --- MODIFIED: Calculate variance on the normalized image ---
-            # The first channel is now the normalized image itself.
-            ch1_img, ch2_var = local_variance_2d(ortho_img_normalized, kernel_size=kernel_size)
-            two_channel_input = torch.stack([ch1_img, ch2_var], dim=0)
-
-            image_to_save = two_channel_input.cpu()  # Shape: (2, H, W)
-            label_to_save = ortho_label.cpu()  # Shape: (1, H, W)
-
-            save_data = {
-                'image': image_to_save,
-                'label': label_to_save,
-                'metadata': {
-                    'source_file': vol_file.name,
-                    'view_axis': view,
-                    'slice_index': slice_idx,
-                    'angpix': vol_data_dict['angpix']
-                }
-            }
-            save_path = output_dir / f"{vol_file.stem}_{view}_{slice_idx}.pt"
-            torch.save(save_data, save_path)
-
-
-def main(args):
-    """Main execution function to prepare 2D data for training."""
-    device = get_device()
-
-    data_dir = Path(args.vol_dir)
-    label_dir = Path(args.mask_dir)
-
-    all_data_pairs = find_data_pairs(data_dir, label_dir)
-    if not all_data_pairs:
-        print(f"Error: No matching volume/label pairs found between '{data_dir}' and '{label_dir}'.")
-        return
-
-    train_pairs, val_pairs = train_test_split(
-        all_data_pairs,
-        test_size=config.VALIDATION_FRACTION,
-        random_state=42,
-        shuffle=True
-    )
-    print(f"\nSplitting {len(all_data_pairs)} volumes into:")
-    print(f"  - Training set:   {len(train_pairs)} volumes")
-    print(f"  - Validation set: {len(val_pairs)} volumes")
-
-    process_and_save_slices(
-        data_pairs=train_pairs,
-        output_dir=Path(config.TRAIN_DATA_DIR),
-        num_sections=args.num_sections,
-        kernel_size=args.kernel_size,
-        device=device,
-        set_name="training"
-    )
-
-    process_and_save_slices(
-        data_pairs=val_pairs,
-        output_dir=Path(config.VAL_DATA_DIR),
-        num_sections=args.num_sections,
-        kernel_size=args.kernel_size,
-        device=device,
-        set_name="validation"
-    )
-
-    print("\n--- Data preparation finished successfully. ---")
-    print("Data was normalized using a robust percentile-based method on 2D projections.")
-    print(f"Training data saved to: {config.TRAIN_DATA_DIR}")
-    print(f"Validation data saved to: {config.VAL_DATA_DIR}")
-
-
-def main_cli():
-    parser = argparse.ArgumentParser(description="Generate 2D training samples from 3D tomograms and masks.")
-    parser.add_argument("--vol_dir", type=str, default=config.REFERENCE_TOMOGRAM_DIR,
-                        help="Directory with input volume files (*_vol.mrc).")
-    parser.add_argument("--mask_dir", type=str, default=config.MASK_OUTPUT_DIR,
-                        help="Directory with input mask/label files (*_label.mrc).")
-    parser.add_argument("--num_sections", type=int, default=config.NUM_SECTIONS_PER_VOLUME,
-                        help="Number of 2D sections to extract per volume.")
-    parser.add_argument("--kernel_size", type=int, default=config.LOCAL_VARIANCE_KERNEL_SIZE,
-                        help="Kernel size for local variance calculation.")
-
+def main():
+    parser = argparse.ArgumentParser(description="Generate standardized 2D training samples from 3D tomograms using robust 3D preprocessing.")
+    parser.add_argument("--vol_dir", type=str, default=config.REFERENCE_TOMOGRAM_DIR)
+    parser.add_argument("--mask_dir", type=str, default=config.MASK_OUTPUT_DIR)
+    parser.add_argument("--out_train_dir", type=str, default=config.TRAIN_DATA_DIR)
+    parser.add_argument("--out_val_dir", type=str, default=config.VAL_DATA_DIR)
     args = parser.parse_args()
-    main(args)
 
+    device = get_device()
+    vol_dir, mask_dir = Path(args.vol_dir), Path(args.mask_dir)
+    out_train_dir, out_val_dir = Path(args.out_train_dir), Path(args.out_val_dir)
+    out_train_dir.mkdir(parents=True, exist_ok=True); out_val_dir.mkdir(parents=True, exist_ok=True)
+
+    all_data_pairs = find_data_pairs(vol_dir, mask_dir)
+    if not all_data_pairs: raise FileNotFoundError("No tomogram/mask pairs found.")
+
+    logging.info("Scanning all tomograms to determine the universal target shape...")
+    all_shapes = [mrcfile.open(p[0], permissive=True).data.shape for p in all_data_pairs]
+    max_dims = np.max(np.array(all_shapes), axis=0)
+    target_shape = tuple(int(d + (d % 2)) for d in max_dims)
+    logging.info(f"All volumes will be resized and padded to the universal 3D shape: {target_shape}")
+
+    np.random.seed(42); np.random.shuffle(all_data_pairs)
+    val_split_idx = int(len(all_data_pairs) * config.VALIDATION_FRACTION)
+    train_pairs, val_pairs = all_data_pairs[val_split_idx:], all_data_pairs[:val_split_idx]
+    logging.info(f"Splitting into {len(train_pairs)} train and {len(val_pairs)} val volumes.")
+
+    for split_name, data_pairs, output_dir in [("TRAIN", train_pairs, out_train_dir), ("VAL", val_pairs, out_val_dir)]:
+        logging.info(f"--- Processing {split_name} set ---")
+        for vol_file, label_file in tqdm(data_pairs, desc=f"Processing {split_name} Tomograms"):
+            volume_std, label_std = None, None
+            try:
+                volume = torch.from_numpy(mrcfile.open(vol_file, permissive=True).data.astype(np.float32))
+                label = torch.from_numpy(mrcfile.open(label_file, permissive=True).data.astype(np.int8))
+                
+                volume_std = resize_and_pad_3d(volume, target_shape, mode='image').to(device)
+                label_std = resize_and_pad_3d(label, target_shape, mode='label').to(device)
+                
+                D, H, W = volume_std.shape
+
+                for i in range(config.NUM_SECTIONS_PER_VOLUME):
+                    
+                    # --- MODIFICATION TO SUM 15 FRAMES ---
+                    # We need a 7-pixel margin on each side of the center slice.
+                    margin = 7 
+                    axis_to_slice = torch.randint(1, 3, (1,)).item()
+                    
+                    if axis_to_slice == 1: # XZ view
+                        # Ensure slice_idx is not too close to the edge
+                        slice_idx = torch.randint(margin, H - margin, (1,)).item()
+                        vol_slab = volume_std[:, slice_idx - margin : slice_idx + margin + 1, :]
+                        ortho_img = torch.mean(vol_slab, dim=1)
+                        ortho_label = label_std[:, slice_idx, :]
+                    else: # YZ view
+                        # Ensure slice_idx is not too close to the edge
+                        slice_idx = torch.randint(margin, W - margin, (1,)).item()
+                        vol_slab = volume_std[:, :, slice_idx - margin : slice_idx + margin + 1]
+                        ortho_img = torch.mean(vol_slab, dim=2)
+                        ortho_label = label_std[:, :, slice_idx]
+
+                    ortho_img_norm = robust_normalization(ortho_img)
+                    ortho_img_var = local_variance_2d(ortho_img_norm, config.LOCAL_VARIANCE_KERNEL_SIZE)
+                    two_channel_input = torch.stack([ortho_img_norm, ortho_img_var], dim=0)
+
+                    save_path = output_dir / f"{output_dir.name}_{vol_file.stem}_view_{i}.pt" # Unique filenames
+                    torch.save({'image': two_channel_input.cpu(), 'label': ortho_label.cpu().long()}, save_path)
+            
+            except Exception as e:
+                logging.error(f"Failed to process {vol_file.name}. Error: {e}", exc_info=True)
+            finally:
+                if volume_std is not None: del volume_std
+                if label_std is not None: del label_std
+                gc.collect()
+                if torch.cuda.is_available(): torch.cuda.empty_cache()
 
 if __name__ == "__main__":
-    main_cli()
+    main()

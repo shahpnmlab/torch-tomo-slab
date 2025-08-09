@@ -9,7 +9,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from torch_tomo_slab.data.dataset import PTFileDataset
 
 # Path to your prepared data
-data_dir = Path("/home/pranav/data/training/torch-tomo-slab/prepared_data/labels/") # Adjust this
+data_dir = Path("/home/pranav/data/training/torch-tomo-slab/prepared_data/val/") # Adjust this
 all_pt_files = sorted(list(data_dir.glob("*.pt")))
 
 # Load a few samples
@@ -26,6 +26,7 @@ for i in random_idx:
     ch2 = image[1]
     
     print(f"\n--- Sample {i} ---")
+    print(f"Sample shape:{image.shape}")
     print(f"Channel 1: min={ch1.min():.2f}, max={ch1.max():.2f}, mean={ch1.mean():.2f}, std={ch1.std():.2f}")
     print(f"Channel 2: min={ch2.min():.2f}, max={ch2.max():.2f}, mean={ch2.mean():.2f}, std={ch2.std():.2f}")
     
